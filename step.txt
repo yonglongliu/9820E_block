@@ -1,0 +1,20 @@
+Hi,
+ 
+PC Environment configure: Ubantu 16.04 or up version, with Python2.7，Java installed
+ 
+ copy 基础版本img 到  software/src
+ copy 要升级到的版本img 到  software/tgt
+
+ 
+make  													//# make all the tools, output in bin/, framework/ and obj/.
+make links  										//# generate some soft symlinks
+./prepare_pkg_start.sh  				// #Package src, tgt to zip files, be ready for diff package generation.
+./gen_update_pkg_start.sh  			// # Diff package generation  
+				
+																key=$CURRENTDIR/testkeys/releasekey  的路径要选对（user debug 相应的testkeys 下面的文件和code 一致）
+																gen_update_pkg_start.sh					-pwd 现在没有用   （脚本里面没有对这个密码进行解析）
+																releasetools/ota_from_target_files.py  里面直接替换新密码即可；（如果密码有改动）
+																
+
+The “update.zip” is the FOTA package.
+ 

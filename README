@@ -1,0 +1,66 @@
+
+#////////////////fota tools install package/////////////////
+/*
+************************************************************
+# Notes: 【SPRD】能升级spl，除prodnv、logo、cache、userdata分区之外，别的分区都能升级。
+
+#configure 
+#-> check dependancies for prebuilt tools
+
+make 
+-> make all the tools, just mkdir bin and framework
+
+make links
+-> generate some soft symlinks.
+************************************************************
+*/
+
+/*  
+  step 1 : make and export
+*/
+
+ $ cd /path/to/fotatools
+ $ make
+ $ make links
+ $ export PATH=$PATH:/path/to/fotatools/bin
+
+/*
+  step2 : generate Target_Files zip.
+*/
+ 
+$ prepare_pkg /path/to/source_version /path/to/tf_sv.zip
+$ prepare_pkg /path/to/target_version /path/to/tf_tv.zip
+
+/*
+* step 3-A : generate full upgrade package
+*/
+$ gen_update_pkg tgt=/path/to/tf_tv.zip key=/path/to/releasekey -pwd=XXX cu=**** /path/to/full-tv.zip
+
+/**
+* step 3-B : generate diff upgrade package.
+*/
+ $ gen_update_pkg tgt=/path/to/tf_tv.zip src=/path/to/tf_sv.zip key=/path/to/releasekey -pwd=XXX /path/to/diff-sv-tv.zip
+
+
+[Recommend]
+/*
+  step 1 : make(Once)
+*/
+
+ $ cd /path/to/fotatools
+ $ make
+ $ make links
+
+/*
+  step2 : put the two building images into software/src and software/tgt(if full package, only this), src is base software and tgt is target software, then call
+*/
+./prepare_pkg_start.sh
+/*
+  step 3-A : generate the incremental package, need configure the signature key and password in file:gen_update_pkg_start.sh, then call
+*/
+./gen_update_pkg_start.sh
+
+/*
+  step 3-B : generate the full package, need configure the signature key and password in file:gen_full_update_pkg_start.sh, then call
+*/
+./gen_full_update_pkg_start.sh

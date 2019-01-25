@@ -1,0 +1,20 @@
+upgrade files list
+
+MUST:
+ramdisk.img
+boot.img
+ramdisk-recovery.img
+recovery.img
+system.img
+u-boot.bin
+u-boot-spl-16k.bin
+
+*_fota_meta (RADIO/ltedsp.bin , ltegdsp.bin, ltemodem.bin, ltenvitem.bin, pmsys.bin)
+
+Optional:
+
+wcnmodem.bin
+wcnfdl.bin
+logo.img
+
+

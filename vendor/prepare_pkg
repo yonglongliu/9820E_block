@@ -1,0 +1,568 @@
+#!/bin/bash
+#© 2017 KAI OS TECHNOLOGIES (HONG KONG) LIMITED, all rights reserved.
+# prepare version.zip containing all files necessaries to create a diff package
+# 
+# usage :
+#
+# prepare_pkg [-h|--help] [-d|--debug] <dir to release files> <output archive>
+#
+# options :
+# -h|--help: Optional: If this option is given, then the tool just prints the usage of this tool so that the user can refresh his mind on the way this tool works and exits.
+# -d|--debug: Optional: If this option is given, then the tool should run in debug mode. The debug mode just activates additional output on STDOUT in order to understand the processing of the tool and detect an eventual location of a problem.
+# <dir to release files>: Mandatory. This parameter is a path to a directory that will only contain ALL the file set of a full version firmware. It is typically the content of Internal web directory.
+# NOTE 1: All the files found in this directory will be considered as belonging to a WHOLE file set including the accidentally created files like log files, backup files from some text editors, etc ... .
+# NOTE 2: The content of this directory should be considered as a white box as the FOTA Admin Console needs to generate it. This folder should contain a flat structure (meaning that it should not contain subfolders but only files).
+# <output archive>: Mandatory. This parameter specifies a path to a (non existing) file that will contain the result of the tool processing, i.e. the Full Version File Set. The format of this Full Version File Set is totally free and is regarded as a black box. 
+# NOTE: See USE.03 for naming convention of the output archive.
+
+
+VERBOSE=""
+debug="false"
+
+usage() {
+echo "
+ usage :
+
+ prepare_pkg [-h|--help] [-d|--debug] <dir to release files> <output archive>
+
+ parameters :
+ <dir to release files>: path to a directory that will only contain ALL the file set of a full version firmware.
+ <output archive>      : path to a (non existing) file that will contain the result of the tool processing
+
+
+ options :
+ -h|--help: print this help and exits.
+ -d|--debug: If this option is given, then the tool should run in debug mode. 
+             The debug mode just activates additional output on STDOUT 
+             in order to understand the processing of the tool and detect an eventual location of a problem.
+"
+}
+
+
+getargs() {
+
+index=0
+for parameter in $* ;do
+  start=$(expr match "${parameter}" '-\|--') ### match begin
+  option=${parameter:$start} #from start number to get parameters
+  if [[ $start -gt 0 ]];then
+    if [[ "$option" == "h" || "$option" == "help" ]];then  # print usage help
+      usage && rm -rf $TMP_DIR && exit 0
+    elif [[ "$option" == "d" || "$option" == "debug" ]];then  # set deug
+      export debug="true"
+    else
+      LogE "unvalid option $parameter. try --help"
+    fi
+  elif [[ ${parameter:0:1} != '-' ]];then # get from 0 to 1 bytes  and compare to '-'
+    if [[ $index -eq 0 ]];then input_dir=$parameter;fi
+    if [[ $index -eq 1 ]];then output_pkg=$parameter;fi
+    ((index++))
+  else
+   LogE "!!unvalid parameter '$parameter' !!\n"
+  fi
+done
+
+}
+
+LogE() {
+echo "$(date "+%Y/%m/%d %T") [ERROR] $1"
+rm -rf $TMP_DIR
+exit 1
+
+}
+
+LogW() {
+echo "$(date "+%Y/%m/%d %T") [WARNING] $1"
+}
+
+
+LogI() {
+echo "$(date "+%Y/%m/%d %T") [INFO] $1"
+}
+
+LogD() {
+if [[ $debug == "true" ]];then
+  echo "$(date "+%Y/%m/%d %T") [DEBUG] $1"
+fi
+}
+
+
+error() {
+if [[ -n "$2" ]];then echo $2;fi
+#rm -rf $TMP_DIR/
+exit $1
+}
+
+#
+# ext4_dump <image.ext4.raw> <path/to/output/dir>
+#
+#
+#
+ext4_dump() {
+
+#get the root file list 
+list=$(debugfs -R "ls -p" $1 2>"$TMP_DIR"/debugfs.stderr | awk -F "/" '{ print $6 }')
+for file in $list;do 
+  debugfs -R "rdump $file $2" $1 2>>"$TMP_DIR"/debugfs.stderr
+  while read line ;do
+    LogD "debugfs : $line"
+  done <"$TMP_DIR"/debugfs.stderr
+done
+rm "$TMP_DIR"/debugfs.stderr
+
+}
+
+#
+#  function list_recurse()
+#
+# list_recurse <image> <fs entry>  
+#
+# example ls image.etx4.raw . 
+#
+list_recurse() {
+local img=$1
+local fn=$2
+local out=$3
+
+if [[ -z "$img" ]];then
+  return 0
+fi
+
+stat=$(debugfs -R "ls -p $fn" $img 2>/dev/null )
+
+#LogI "stat is : $stat "
+if [[ -z "$stat" ]];then
+ LogE "entry '$fn' doesn't exist in the ext4 image $img"
+fi
+
+debugfs -R "ls -p $fn " $1 2>/dev/null | while read line ; do
+
+name=$(echo $line | awk -F "/" '{ print $6}')
+user=$(echo $line | awk -F "/" '{ print $4}')
+group=$(echo $line | awk -F "/" '{ print $5}')
+perm=$(echo $line | awk -F "/" '{ print $3}')
+if [[ $name == ".." || -z "$name" ]];then
+  LogD "list_recurse : skipping <$name> "
+elif [[ $name == "." ]];then
+  #  the current dir perms
+  echo "${fn}/${name} $user $group ${perm:3}" >>$out
+elif [[ ${perm:0:2} == "04" ]];then
+  #echo ">>>>>>$name is a directory : parsing ${fn}/${name}"
+  list_recurse $img "${fn}/${name}" $out
+  #echo ">>>>>> end ${fn}/${name}"
+else
+  echo "${fn}/${name} $user $group ${perm:3}" >>$out
+fi
+
+done
+
+}
+
+exec_cmd() {
+
+$* >"$TMP_DIR"/cmd.stdout 2>"$TMP_DIR"/cmd.stderr #excute cmd one by one , and output msg in cmd.stdout or cmd.stderr!
+res=$? # get cmd execute results, success or failed!
+# output logs
+while read line ;do
+LogI "$line"
+done < "$TMP_DIR"/cmd.stdout
+
+while read line ;do
+LogI "$line"
+done < "$TMP_DIR"/cmd.stderr
+
+rm "$TMP_DIR"/cmd.stdout "$TMP_DIR"/cmd.stderr
+
+if [[ $res -ne 0 ]];then
+  LogE "$* failed"
+fi
+
+}
+
+#  we have two types images , so we define two type sources : src1 , src2
+#  src1 : images for teleweb tool to download!
+#  src2 : images for flash   tool to download!
+#
+copy_img() {
+src1=$1
+src2=$2
+dest=$3
+
+if [[ $# != 3 ]];then
+ LogE "invalid number of parameters for copy_img ($#): $*. check the input directory"
+fi
+
+LogD "copy_img $1 $2 $3"
+
+if [[ -a $src1 ]];then
+  stdout=$(cp $VERBOSE "$src1" $dest 2>&1)
+  if [[ $? -eq 0 ]];then
+    LogI "copy_img : $stdout"
+  else
+    LogE "copy_img : $stdout"
+  fi
+elif [[ -a $src2 ]];then
+  stdout=$(cp $VERBOSE "$src2" $dest 2>&1 )
+  if [[ $? -eq 0 ]];then
+    LogI "copy_img : $stdout"
+  else
+    LogE "copy_img : $stdout"
+  fi
+else
+  LogE "$(basename $3) image not found in $(dirname $src2)"
+fi
+}
+
+
+function gen_zip_for_version() {
+local targetdir="$1" ### input dir
+local output="$2"    ### out_pkg dir
+### mkdir related  dirs for fota
+stdout=$(mkdir -p $VERBOSE  $TMP_DIR/BOOT/RAMDISK)
+LogD "$stdout"
+stdout=$(mkdir -p $VERBOSE  $TMP_DIR/IMAGES)
+LogD "$stdout"
+stdout=$(mkdir -p $VERBOSE  $TMP_DIR/META)
+LogD "$stdout"
+stdout=$(mkdir -p $VERBOSE  $TMP_DIR/OTA/bin)
+LogD "$stdout"
+stdout=$(mkdir -p $VERBOSE  $TMP_DIR/RADIO)
+LogD "$stdout"
+stdout=$(mkdir -p $VERBOSE  $TMP_DIR/RECOVERY/RAMDISK)
+LogD "$stdout"
+stdout=$(mkdir -p $VERBOSE  $TMP_DIR/DATA)
+LogD "$stdout"
+LogI "generating $output "
+
+#in cocktail system and custpack files are sometimes stored as zip files
+
+exec_cmd "cp  $targetdir/system.img  $TMP_DIR/IMAGES/system.img "
+
+#systemzip=$(ls "$targetdir"/[Yy]*.zip* 2>/dev/null)
+#if [[ -n "$systemzip" ]];then # check  $systemzip != zero , then unzip it below
+#  exec_cmd "unzip  -j $systemzip  -d $TMP_DIR/zip"
+#  copy_img "$TMP_DIR"/zip/[Yy]*.img "$TMP_DIR"/zip/system.img "$TMP_DIR"/IMAGES/system.img # 
+#  rm -rf "$TMP_DIR"/zip
+#else # zero , we execute it
+#  copy_img "$targetdir"/[Yy]*.img "$targetdir"/system.img "$TMP_DIR"/IMAGES/system.img #
+#fi
+
+#ramdisk.img
+exec_cmd "cp $targetdir/ramdisk.img $TMP_DIR/BOOT/RAMDISK/ "
+exec_cmd "cd  $TMP_DIR/BOOT/RAMDISK/ "
+exec_cmd "gunzip -S .img ramdisk.img"
+exec_cmd "cpio -i -F ramdisk  "  
+exec_cmd "rm ramdisk "
+#ramdisk-recovery.img
+exec_cmd "cp $targetdir/ramdisk-recovery.img $TMP_DIR/RECOVERY/RAMDISK/ "
+exec_cmd "cd  $TMP_DIR/RECOVERY/RAMDISK/ "
+exec_cmd "gunzip -S .img ramdisk-recovery.img"
+exec_cmd "cpio -i -F ramdisk-recovery  "  
+exec_cmd "rm ramdisk-recovery "
+
+######################## check system magic number ###########################
+system_is_ext4_raw=true
+sysmagic=$(hexdump -n 4 -e '"%X"' $TMP_DIR/IMAGES/system.img)
+if [[ $sysmagic == "ED26FF3A" ]];then
+  LogI "sysmagic ==  "ED26FF3A" "
+  simg2img $TMP_DIR/IMAGES/system.img $TMP_DIR/system.img.ext4.raw
+  #rm $TMP_DIR/IMAGES/system.img
+  system_is_ext4_raw=false
+else
+  LogI "sysmagic !=  "ED26FF3A" "
+  cp $TMP_DIR/IMAGES/system.img $TMP_DIR/system.img.ext4.raw
+fi
+
+######################  dump the files from the file system image ##############
+mkdir -p $TMP_DIR/SYSTEM && ext4_dump $TMP_DIR/system.img.ext4.raw $TMP_DIR/SYSTEM || LogE "ext4_dump of system failed"
+chmod 755 -R $TMP_DIR/SYSTEM
+rm -rf $TMP_DIR/SYSTEM/lost+found
+
+# create the file system config file from info in the file system image
+#if [[ ! -a $TMP_DIR/BOOT/RAMDISK/file_contexts ]];then
+#  LogE "Not exist file_contexts !"
+#fi
+#selinux_fc=$TMP_DIR/BOOT/RAMDISK/file_contexts
+
+list_recurse $TMP_DIR/system.img.ext4.raw . $TMP_DIR/list_recurse_system.out
+
+# delete lost+found
+#grep -v "lost+found" $TMP_DIR/list_recurse_system.out_tmp  > $TMP_DIR/list_recurse_system.out
+#cat $TMP_DIR/list_recurse_system.out | awk '{ gsub("/[.]$","",$1) ; gsub("^[.]","system") ; print }'| fs_config -C  -S $selinux_fc > $TMP_DIR/META/filesystem_config.txt || LogE "list_recurse_system failed"
+
+cat $TMP_DIR/list_recurse_system.out | awk '{ gsub("/[.]$","",$1) ; gsub("^[.]","system") ; print }'| fs_config -C   > $TMP_DIR/META/filesystem_config_original.txt || LogE "list_recurse_system failed"
+
+column=$(sed -n "2, 1p" $TMP_DIR/META/filesystem_config_original.txt  | awk -F" " '{print NF}')
+LogI "column is  $column "
+
+if [ $column == 8 ] ;then 
+  cat $TMP_DIR/META/filesystem_config_original.txt  | awk ' { $5=null;$6=null;$7=nulll;print $0 }' >  $TMP_DIR/META/filesystem_config.txt
+  rm $TMP_DIR/META/filesystem_config_original.txt
+else
+  mv $TMP_DIR/META/filesystem_config_original.txt  $TMP_DIR/META/filesystem_config.txt
+fi
+
+rm -f $TMP_DIR/system.img.ext4.raw
+rm $TMP_DIR/list_recurse_*
+
+#########################################################################
+#custpack
+#custpack_present=false
+#custpackzip=$(ls "$targetdir"/[Cc]*.[Mm][Bb][Nn].zip* 2>/dev/null)
+#if [[ -n "$custpackzip" ]];then
+#  exec_cmd "unzip  -j $custpackzip -d $TMP_DIR/zip"
+#  custpack_file=$(ls "$TMP_DIR"/zip/[Cc]*.[Mm][Bb][Nn]* 2>/dev/null || ls "$TMP_DIR"/zip/custpack.img* 2>/dev/null)
+#else
+#  custpack_file=$(ls "$targetdir"/[Cc]*.[Mm][Bb][Nn]* 2>/dev/null || ls "$targetdir"/custpack.img* 2>/dev/null )
+#fi
+#if [[ -n "$custpack_file" ]];then 
+#  copy_img  "$custpack_file" "$targetdir"/custpack.img* "$TMP_DIR"/IMAGES/custpack.img
+#  rm -rf "$TMP_DIR"/zip
+#  custpack_present=true
+#else
+#  custpack_present=false
+#  LogI "custpack not found in $targetdir"
+#fi
+####TODO custpack ext4 info
+
+copy_img "$targetdir"/boot-sign.img "$targetdir"/boot.img $TMP_DIR/IMAGES/boot.img
+#copy_img "$targetdir"/[Cc]*.[Mm][Bb][Nn]* "$targetdir"/cache.img $TMP_DIR/IMAGES/cache.img
+copy_img "$targetdir"/recovery-sign.img "$targetdir"/recovery.img $TMP_DIR/IMAGES/recovery.img
+#copy_img "$targetdir"/[Uu]*.[Mm][Bb][Nn]* "$targetdir"/userdata.img "$TMP_DIR"/IMAGES/userdata.img
+#copy_img "$targetdir"/[Dd]*.[Mm][Bb][Nn]*  $targetdir/dt.img $TMP_DIR/dt.img
+
+#logo
+if [ -a "$targetdir"/logo.bmp ] || [ -a "$targetdir"/NATIVE_HD_logo_256.bmp ];then
+  copy_img "$targetdir"/logo.bmp "$targetdir"/NATIVE_HD_logo_256.bmp $TMP_DIR/RADIO/logo.bmp
+else
+  LogI "logo.bmp not found"
+fi
+
+#support uboot and spl upgrade
+copy_img "$targetdir"/u-boot-sign.bin  $targetdir/u-boot.bin $TMP_DIR/RADIO/u-boot.bin
+copy_img "$targetdir"/u-boot-spl-16k-sign.bin  $targetdir/u-boot-spl-16k.bin $TMP_DIR/RADIO/u-boot-spl-16k.bin
+copy_img "$targetdir"/sml-sign.bin  $targetdir/sml.bin $TMP_DIR/RADIO/sml.bin
+copy_img "$targetdir"/tos-sign.bin  $targetdir/tos.bin $TMP_DIR/RADIO/tos.bin
+#for some platform support wcnmodem.bin and wcnfdl.bin upgrade
+wcn_modem=$(ls "$targetdir"/EXEC_KERNEL_IMAGE0.bin 2>/dev/null)
+if [[ -z "$wcn_modem" ]];then
+  wcn_modem=$(ls "$targetdir"/wcnmodem.bin 2>/dev/null)
+  if [[ -n "$wcn_modem" ]];then
+    copy_img "$targetdir"/EXEC_KERNEL_IMAGE0.bin $targetdir/wcnmodem.bin $TMP_DIR/RADIO/wcnmodem.bin
+  fi
+else
+  copy_img "$targetdir"/EXEC_KERNEL_IMAGE0.bin $targetdir/wcnmodem.bin $TMP_DIR/RADIO/wcnmodem.bin
+fi
+
+wcn_fdl=$(ls "$targetdir"/fdl1_wcn.bin 2>/dev/null)
+if [[ -z "$wcn_fdl" ]];then
+  wcn_modem=$(ls "$targetdir"/wcnfdl.bin 2>/dev/null)
+  if [[ -n "$wcn_fdl" ]];then
+    copy_img "$targetdir"/fdl1_wcn.bin $targetdir/wcnfdl.bin $TMP_DIR/RADIO/wcnfdl.bin
+  fi
+else
+  copy_img "$targetdir"/fdl1_wcn.bin $targetdir/wcnfdl.bin $TMP_DIR/RADIO/wcnfdl.bin
+fi
+###########################################################################################
+### check whether TCT FOTA META .zip is exist!
+fota_meta=$(ls "$targetdir"/[Zz]*.[Mm][Bb][Nn]* 2>/dev/null)
+
+if [[ -z "$fota_meta" ]];then
+   fota_meta=$(ls "$targetdir"/[Zz]*.[Zz][Ii][Pp]* 2>/dev/null)
+   if [[ -z $fota_meta ]];then
+     fota_meta=$(ls "$targetdir"/*_fota_meta.[Zz][Ii][Pp]* 2>/dev/null)
+   fi 
+fi
+
+if [[ -z "$fota_meta" ]];then
+  LogE "fota meta info zip not found in perso (z*.[zip|mbn] )"
+fi
+LogI "begin to unzip $fota_meta ..."
+exec_cmd "unzip $fota_meta -d $TMP_DIR/mz"
+
+## RADIO
+radio_exist=$(ls -A "$TMP_DIR"/mz/RADIO/ 2>/dev/null)
+
+if [[ -n "$radio_exist" ]];then
+  exec_cmd "cp $TMP_DIR/mz/RADIO/* $TMP_DIR/RADIO "
+fi
+
+if [[ -a "$targetdir"/ltedsp.bin ]];then
+  copy_img "$targetdir"/ltedsp.bin $targetdir/SharkLE_FEATURE_PHONE_LTEA_DSP.bin $TMP_DIR/RADIO/ltedsp.bin
+fi
+
+if [[ -a "$targetdir"/ltegdsp.bin ]];then
+  copy_img "$targetdir"/ltegdsp.bin "$targetdir"/SHARKLE1_DM_DSP.bin $TMP_DIR/RADIO/ltegdsp.bin
+fi
+
+if [[ -a "$targetdir"/ltemodem.bin ]];then
+  copy_img "$targetdir"/ltemodem.bin "$targetdir"/SC9600_sharkle_pubcp_Feature_Phone_modem.dat $TMP_DIR/RADIO/ltemodem.bin
+fi
+
+if [[ -a "$targetdir"/ltenvitem.bin ]];then
+  copy_img "$targetdir"/ltenvitem.bin "$targetdir"/sharkle_pubcp_Feature_Phone_*_nvitem.bin $TMP_DIR/RADIO/ltenvitem.bin
+fi
+
+if [[ -a "$targetdir"/pmsys.bin ]];then
+  copy_img "$targetdir"/pmsys.bin "$targetdir"/sharkle_cm4.bin $TMP_DIR/RADIO/pmsys.bin
+fi
+
+if [[ -a "$targetdir"/gnssmodem.bin ]];then
+  copy_img "$targetdir"/gnssmodem.bin "$targetdir"/Gnssmodem.bin $TMP_DIR/RADIO/gnssmodem.bin
+fi
+
+if [[ -a "$targetdir"/gnssbdmodem.bin ]];then
+  copy_img "$targetdir"/gnssbdmodem.bin "$targetdir"/Gnssbdmodem.bin $TMP_DIR/RADIO/gnssbdmodem.bin
+fi
+
+# copy system.map
+if [[ -a $TMP_DIR/mz/IMAGES/system.map ]];then
+exec_cmd "cp $TMP_DIR/mz/IMAGES/system.map $TMP_DIR/IMAGES/ "
+else
+LogE "No system.map"
+fi
+# copy sysinfo
+if [[ -a $TMP_DIR/mz/checksum ]];then
+exec_cmd "cp $TMP_DIR/mz/checksum $TMP_DIR/META/ "
+fi
+#copy data
+cp -rf $TMP_DIR/mz/DATA/* $TMP_DIR/DATA
+
+## META misc_info.txt
+exec_cmd "cp $TMP_DIR/mz/misc_info.txt $TMP_DIR/META/ "
+exec_cmd "cp $TMP_DIR/mz/file_contexts_temp $TMP_DIR/META/ "
+
+if [ -a $TMP_DIR/mz/releasetools.py ];then
+  exec_cmd "cp $TMP_DIR/mz/releasetools.py $TMP_DIR/META/ "
+else ### when oem_fota_meta.zip has no releasetools.py, we use oem releasetools
+  #for mota
+  LogI "==== use releasetools.py replace releasetools in toolkit"
+  exec_cmd "cp $TOOL_DIR/vendor/projects/releasetools.py $TMP_DIR/META/releasetools.py "
+fi
+
+### key.txt
+if [ -a $TMP_DIR/mz/key.txt ];then
+  exec_cmd "cp $TMP_DIR/mz/key.txt $TMP_DIR/META/key.txt "
+else 
+  LogI "==== use key.txt replace key.txt in toolkit"
+  exec_cmd "cp $TOOL_DIR/vendor/projects/secure_boot_tools/key.txt $TMP_DIR/META/key.txt "
+fi
+### VLRSignnn
+if [ -a $TMP_DIR/mz/VLRSign ];then
+  exec_cmd "cp $TMP_DIR/mz/VLRSign $TMP_DIR/META/VLRSign "
+else
+  LogI "==== use VLRSign replace VLRSign in toolkit"
+  exec_cmd "cp $TOOL_DIR/vendor/projects/secure_boot_tools/VLRSign $TMP_DIR/META/VLRSign "
+fi
+### BscGen
+if [ -a $TMP_DIR/mz/BscGen ];then
+  exec_cmd "cp $TMP_DIR/mz/BscGen $TMP_DIR/META/BscGen "
+else 
+  LogI "==== use BscGen replace BscGen in toolkit"
+  exec_cmd "cp $TOOL_DIR/vendor/projects/secure_boot_tools/BscGen $TMP_DIR/META/BscGen "
+fi
+
+## OTA updater
+if [[ ! -a $TMP_DIR/mz/updater ]];then
+  if [[ ! -a $TMP_DIR/mz/OTA/bin/updater ]];then
+    LogE "updater not found in oem_fota_meta zip!"
+  else
+    exec_cmd "cp $TMP_DIR/mz/OTA/bin/updater $TMP_DIR/OTA/bin/ "
+  fi
+else
+  exec_cmd "cp $TMP_DIR/mz/updater $TMP_DIR/OTA/bin/ "
+fi
+
+exec_cmd "cp $TMP_DIR/mz/OTA/bin/applypatch $TMP_DIR/OTA/bin/ "
+exec_cmd "cp $TMP_DIR/mz/OTA/bin/applypatch_static $TMP_DIR/OTA/bin/ "
+exec_cmd "cp $TMP_DIR/mz/OTA/bin/check_prereq $TMP_DIR/OTA/bin/ "
+exec_cmd "cp $TMP_DIR/mz/OTA/bin/nvmerge $TMP_DIR/OTA/bin/ "
+exec_cmd "cp $TMP_DIR/mz/OTA/bin/pack $TMP_DIR/OTA/bin/ "
+exec_cmd "cp $TMP_DIR/mz/OTA/bin/repart $TMP_DIR/OTA/bin/ "
+exec_cmd "cp $TMP_DIR/mz/OTA/bin/splmerge $TMP_DIR/OTA/bin/ "
+
+### for modem update config 
+if [ -a $TMP_DIR/mz/modem.cfg ];then
+  exec_cmd "cp $TMP_DIR/mz/modem.cfg $TMP_DIR/OTA/bin "
+else ### when oem_fota_meta.zip has no ota_scatter.txt, we use ota_scatter.txt
+  LogI "==== use modem.cfg in project "
+  exec_cmd "cp $TOOL_DIR/vendor/projects/fireware_cfg/modem.cfg $TMP_DIR/OTA/bin "
+fi
+
+if [ -a $TMP_DIR/mz/nvmerge.cfg ];then
+  exec_cmd "cp $TMP_DIR/mz/nvmerge.cfg $TMP_DIR/OTA/bin "
+else ### when oem_fota_meta.zip has no ota_update_list.txt, we use ota_update_list.txt
+  LogI "==== use nvmerge.cfg in project"
+  exec_cmd "cp $TOOL_DIR/vendor/projects/fireware_cfg/nvmerge.cfg $TMP_DIR/OTA/bin "
+fi
+
+rm -rf $TMP_DIR/mz/
+
+############################################################################################
+
+if [[ -a "$output" ]];then rm "$output";fi
+
+if [[ ${output:0:1} == "/" ]];then
+  output_absolute_path=$output
+else
+  output_absolute_path=$EXEC_DIR/$output
+fi
+cd $TMP_DIR
+
+LogI "Now begin to generating ota target file zip ... "
+
+zip -qry "$output" * || error 1 "error while generating zip"
+
+rm -rf $TMP_DIR
+
+LogI "images package $output generated for $1  finished successfully !" 
+
+}
+
+
+####
+####START here
+
+user=$(id -u -n)
+TMP_DIR=$(mktemp -d)
+LogI "user is : $user !" 
+TOOL_DIR=$(which $0)
+TOOL_DIR=$(dirname $TOOL_DIR)/..
+
+EXEC_DIR=$(pwd)
+
+getargs "$*" # get input dir and output_pkg dir
+
+if [[ -z "$input_dir" || -z "$output_pkg" ]];then ### NOTE: output_pkg contains pkg name, not only include dir!
+  LogE "missing parameters . use -h for help"
+  exit 1
+fi
+
+
+if [[ ! -d $input_dir ]];then
+  LogE "input dir '$input_dir' not a directory. use -h for help"
+  exit 1
+fi
+
+outdir=$(dirname "$output_pkg" ) ### separate dir from output pkg 
+if [[ ! -d "$outdir" ]];then
+  LogE "output dir '$outdir' dir not found."
+  exit 1
+fi
+
+VERBOSE="-v"
+if [[ $debug == "true" ]];then
+  LogD "debug is on"
+fi
+
+source tools_version.sh # export VERSION="?"
+LogI "tools version : $VERSION"
+if [[ -f "$output_pkg.zip" ]];then
+  rm "$output_pkg.zip"
+  LogI "Remove exist $output_pkg.zip"
+fi
+gen_zip_for_version $input_dir $output_pkg
+
+rm -rf $TMP_DIR
+
+

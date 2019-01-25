@@ -1,0 +1,15 @@
+V1.0.0
+new secure boot mechanism, we need a new tools
+
+V1.0.2
+fixed an copy error when radio is empty
+
+V1.0.3
+Fixed a file permission problem
+remove an unuseful file
+
+V1.0.4
+Add logo into upgrade list
+
+V1.0.5
+Fixed signature key password problem

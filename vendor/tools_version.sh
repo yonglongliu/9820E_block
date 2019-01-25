@@ -1,0 +1,1 @@
+VERSION="Kaios-SPRD-Block(9820E)-V1.0.5"

@@ -1,0 +1,358 @@
+#!/usr/bin/env python
+# Create By Spreadst
+
+
+"""
+Used for make update package for userdata backup and resume.
+backup file would be generated to sdcard.
+if no backup file, update use the package will backup.
+other wise, update use the package will do resume.
+
+Usage:  ota_for_userdata_backup_resume [flags] output_ota_package
+
+  -d  (--dev_path) <device file>
+      backup partition device file path, used for mount
+
+  -K  (--sdcard_dev) <device file>
+      sdcard device file path, used for mount
+
+  -m  (--mount_point) <directory>
+      backup partition mount point
+
+  -f  (--fstab) <fstable file>
+      file system table file, if no dev_path given, used for
+      find device file path
+
+  -w  (--white_list)
+      use white list to filter path to backup
+
+  -b  (--black_list)
+      use black list to filter path to backup
+
+  -F  (--filter) <path>
+      add a path filter, all filters would be used for backup
+
+"""
+
+import sys
+
+if sys.hexversion < 0x02070000:
+  print >> sys.stderr, "Python 2.7 or newer is required."
+  sys.exit(1)
+
+import copy
+import errno
+import multiprocessing
+import os
+import re
+import subprocess
+import tempfile
+import time
+import zipfile
+
+from hashlib import sha1 as sha1
+
+import common
+import edify_generator
+import build_image
+import blockimgdiff
+import sparse_img
+
+
+OPTIONS = common.OPTIONS
+OPTIONS.dev_path = None
+OPTIONS.sdcard_dev = None
+OPTIONS.mount_point = "/data"
+OPTIONS.fstab = None
+OPTIONS.white_list = False
+OPTIONS.black_list = False
+OPTIONS.filters = set()
+OPTIONS.updater_binary = None
+OPTIONS.pack_binary = None
+OPTIONS.info_dict = None
+OPTIONS.no_signing = False
+OPTIONS.package_key = None
+OPTIONS.sdcard_paths = ["/sdcard","/storage/sdcard1","/storage/sdcard0"]
+OPTIONS.tmp_path = "/tmp"
+
+OPTIONS.default_binarys = {
+  "updater":"device/sprd/common/ota_bin/updater",
+  "pack":"device/sprd/common/ota_bin/pack",
+}
+
+def CommonRunWithErrStr(args, errorstr=None, runcwd=None, stdindata=None):
+  if runcwd is None:
+    p = common.Run(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+  else:
+    p = common.Run(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=runcwd)
+  if stdindata is None:
+    stdoutdata, stderrdata = p.communicate()
+  else:
+    stdoutdata, stderrdata = p.communicate(stdindata)
+
+  if OPTIONS.verbose:
+    print("return code is %d\n" % p.returncode);
+
+  if p.returncode != 0 and errorstr is not None:
+    raise common.ExternalError("%s:%s" % (errorstr,stderrdata))
+
+  if OPTIONS.verbose:
+    print ("I:%s" % (stdoutdata,))
+    print ("E:%s" % (stderrdata,))
+
+  return stdoutdata, stderrdata
+
+class EdifyGeneratorExt(object):
+  def __init__(self, script):
+    self.script = script.script
+    self.info = script.info
+    self._WordWrap = script._WordWrap
+
+  def Run_program2(self, binary, args):
+    """Run a program named binary"""
+    self.script.append('assert(run_program("%s"' % (binary,) +
+                      "".join([', "%s"' % (i,) for i in args]) +
+                      '));')
+
+  def UnpackPackageFile(self, src, dst):
+    """Unpack a given file from the OTA package into the given
+    destination file."""
+    self.script.append('package_extract_file("%s", "%s");' % (src, dst))
+
+def BuildInfoDict():
+
+  def read_none(f):
+    return ""
+
+  def read_one_dev(f):
+    fstab = "%s %s ext4 defaults encryptable=footer\n" % (OPTIONS.dev_path, OPTIONS.mount_point)
+    fstab += "%s %s vfat defaults defaults" % (OPTIONS.sdcard_dev, OPTIONS.sdcard_paths[0])
+    return fstab
+
+  def read_fstab(f):
+    fstab = open(OPTIONS.fstab, "rb")
+    data = fstab.read()
+    fstab.close()
+    return data
+
+  if OPTIONS.dev_path and OPTIONS.sdcard_dev:
+    read_helper = read_one_dev
+  elif OPTIONS.fstab:
+    read_helper = read_fstab
+  else:
+    read_helper = read_none
+
+  d = {}
+  d["fstab_version"] = 2
+  d["fstab"] = common.LoadRecoveryFSTab(read_helper, d["fstab_version"])
+  d["update_rename_support"] = True
+  d["use_set_metadata"] = True
+
+  OPTIONS.info_dict = d
+
+def FindBinaryInOut(binary_name):
+
+  cmd = ["find", "out/target/product/", "-name", binary_name]
+
+  stdoutdata, stderrdata = CommonRunWithErrStr(cmd,
+                      errorstr=("not found binary \"%s\" in out direcotry" % (binary_name,)))
+
+  cmd = ["grep", "system/bin"]
+  stdoutdata, stderrdata = CommonRunWithErrStr(cmd,
+                      errorstr=("not found \"%s\" in \"out/target/product/*/system/bin\"\n" % (binary_name,)),
+                      stdindata=stdoutdata)
+
+  cmd = ["grep", "-v", "symbols"]
+  stdoutdata, stderrdata = CommonRunWithErrStr(cmd,
+                      errorstr=("not found \"%s\" in \"out/target/product/*/system/bin\"\n" % (binary_name,)),
+                      stdindata=stdoutdata)
+
+  files = stdoutdata.split('\n')
+  return files[0]
+
+def GetBinaryFor(binary_name):
+  binary_path = None
+  if OPTIONS.default_binarys.has_key(binary_name):
+    binary_path = OPTIONS.default_binarys[binary_name]
+
+  if not os.path.exists(binary_path):
+    binary_path = FindBinaryInOut(binary_name)
+
+  print "use [%s] for [%s]" % (binary_path, binary_name)
+
+  return binary_path
+
+def SignOutput(temp_zip_name, output_zip_name):
+  key_passwords = common.GetKeyPasswords([OPTIONS.package_key])
+  pw = key_passwords[OPTIONS.package_key]
+
+  common.SignFile(temp_zip_name, output_zip_name, OPTIONS.package_key, pw,
+                  whole_file=True)
+
+def GetBackupPartitionName():
+  p = OPTIONS.info_dict["fstab"][OPTIONS.mount_point]
+  part_name = os.path.basename(p.device)
+  if OPTIONS.verbose:
+    print "partition name of \'%s\' is \'%s\'." % (OPTIONS.mount_point, part_name)
+  return part_name
+
+def GetPackArgs(backup_file):
+  args=["-s", OPTIONS.mount_point, "-p", backup_file, "-S", "-v"]
+  if OPTIONS.white_list:
+    args.append("-w")
+  if OPTIONS.black_list:
+    args.append("-b")
+  for f in OPTIONS.filters:
+    args.extend(["-P", f])
+
+  return args
+
+def GetSdcardPath():
+  fstab = OPTIONS.info_dict["fstab"]
+  for path in OPTIONS.sdcard_paths:
+    if fstab.has_key(path):
+      return path
+
+  raise ExternalError("not found sdcard mount point")
+
+def WriteBackupOTAPackage(output_zip):
+  input_zip = None
+  part_name = GetBackupPartitionName()
+  sdcard_path = GetSdcardPath()
+
+  temp_backup = "%s/.bak_%s.pak" % (sdcard_path, part_name,)
+  backup_file = "%s/backup_%s.pak" % (sdcard_path, part_name,)
+  pack_exe = "%s/pack" % (OPTIONS.tmp_path,)
+  unpack_exe = "%s/unpack" % (OPTIONS.tmp_path,)
+  pack_in_zip = "META-INF/com/google/android/pack"
+
+  common.ZipWriteStr(output_zip, pack_in_zip, open(OPTIONS.pack_binary, "rb").read())
+
+  script = edify_generator.EdifyGenerator(3, OPTIONS.info_dict)
+  script_ext = EdifyGeneratorExt(script)
+
+  script.Mount(sdcard_path)
+
+  script.Mount(OPTIONS.mount_point)
+
+  script.AppendExtra("""
+if exist("%s") == "True" then
+""" % backup_file)
+
+  script_ext.UnpackPackageFile(pack_in_zip, unpack_exe)
+  script_ext.Run_program2(unpack_exe, ["-p", backup_file, "-S", "-v"])
+
+  script.AppendExtra("""
+else if exist("%s") == "False" then
+""" % backup_file)
+
+  script_ext.UnpackPackageFile(pack_in_zip, pack_exe)
+  script_ext.Run_program2(pack_exe, GetPackArgs(temp_backup))
+  script.RenameFile(temp_backup, backup_file)
+
+  script.AppendExtra("""
+endif;
+endif;
+""")
+
+  script.AddToZip(input_zip, output_zip, input_path=OPTIONS.updater_binary)
+
+def main(argv):
+
+  def option_handler(o, a):
+    if o in ("-d", "--dev_path"):
+      OPTIONS.dev_path = a
+    elif o in ("-K", "--sdcard_dev"):
+      OPTIONS.sdcard_dev = a
+    elif o in ("-m", "--mount_point"):
+      OPTIONS.mount_point = a
+    elif o in ("-f", "--fstab"):
+      OPTIONS.fstab = a
+    elif o in ("-w", "--white_list"):
+      OPTIONS.white_list = True
+    elif o in ("-b", "--black_list"):
+      OPTIONS.black_list = True
+    elif o in ("-F", "--filter"):
+      OPTIONS.filters.add(a)
+    elif o == "--no_signing":
+      OPTIONS.no_signing = True
+    else:
+      return False
+    return True
+
+  args = common.ParseOptions(argv, __doc__,
+                             extra_opts="d:K:m:f:wbF:",
+                             extra_long_opts=["dev_path=",
+                                              "sdcard_dev=",
+                                              "mount_point=",
+                                              "fstab=",
+                                              "white_list",
+                                              "black_list",
+                                              "filter=",
+                                              ],
+                             extra_option_handler=option_handler)
+
+  if len(args) != 1:
+    common.Usage(__doc__)
+    sys.exit(1)
+
+  if (OPTIONS.dev_path is None or OPTIONS.sdcard_dev is None) and OPTIONS.fstab is None:
+    print >> sys.stderr, "(dev_path and sdcard_dev) or fstab must given one of them."
+    common.Usage(__doc__)
+    sys.exit(1)
+
+  if OPTIONS.white_list is True and OPTIONS.black_list is True:
+    print >> sys.stderr, "please select one in white list mode and black list mode."
+    common.Usage(__doc__)
+    sys.exit(1)
+
+  if len(OPTIONS.filters) > 0 and OPTIONS.white_list is False and OPTIONS.black_list is False:
+    print >> sys.stderr, "please select one in white list mode and black list mode."
+    common.Usage(__doc__)
+    sys.exit(1)
+
+  output = args[0]
+
+  OPTIONS.updater_binary = GetBinaryFor("updater")
+  OPTIONS.pack_binary = GetBinaryFor("pack")
+
+  BuildInfoDict()
+
+  while True:
+
+    if OPTIONS.no_signing:
+      if os.path.exists(output): os.unlink(output)
+      output_zip = zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED)
+    else:
+      temp_zip_file = tempfile.NamedTemporaryFile()
+      output_zip = zipfile.ZipFile(temp_zip_file, "w",
+                                   compression=zipfile.ZIP_DEFLATED)
+      #OPTIONS.tempfiles.append(temp_zip_file)
+
+    WriteBackupOTAPackage(output_zip)
+    if OPTIONS.package_key is None:
+      OPTIONS.package_key = OPTIONS.info_dict.get(
+            "default_system_dev_certificate",
+            "build/target/product/security/testkey")
+    break
+
+  output_zip.close()
+
+  if not OPTIONS.no_signing:
+    SignOutput(temp_zip_file.name, output)
+    temp_zip_file.close()
+
+  print "done."
+
+
+if __name__ == '__main__':
+  try:
+    common.CloseInheritedPipes()
+    main(sys.argv[1:])
+  except common.ExternalError, e:
+    print
+    print "   ERROR: %s" % (e,)
+    print
+    sys.exit(1)
+  finally:
+    common.Cleanup()

@@ -1,0 +1,186 @@
+#!/bin/bash
+#© 2017 KAI OS TECHNOLOGIES (HONG KONG) LIMITED, all rights reserved
+#
+# -------------------------------------------------------------------------------------------------------
+#  gen_update_sip.sh
+# -------------------------------------------------------------------------------------------------------
+#  author ajayet - 2011/03/11
+#
+#  gen_update_pkg [-h|--help] [-d|--debug] -src=<src version> tgt=<target version> -key=<key file path> [-pwd=<password>]  <output archive>
+#
+#  options :
+#  -h|--help: If this option is given, then the tool just prints the usage of this tool 
+#           so that the user can refresh his mind on the way this tool works and exits.
+#  -d|--debug: Optional: If this option is given, then the tool should run in debug mode. The debug mode just activates 
+#              additional output on STDOUT in order to understand the processing of the tool and detect an eventual location of a problem.
+#
+#  parameters :
+#  <from full version file set>: source version package
+#  <to full version file set>:   taret version package
+#  <key file path>: This parameter specifies a path to a key file that will be used to sign the generated diff version file set.
+#  <password>: Some keys may be encrypted by a password to protect them.
+#  <output archive>: path to a (non existing) file that will contain the result of the tool processing, 
+
+
+TMP_DIR=$(mktemp -d) ### makedir
+
+usage () {
+
+echo "
+  USAGE :
+  
+  gen_update_pkg [-h|--help] [-d|--debug] src=<source version> tgt=<target version> key=<key file path> [-pwd=<password>]  <output archive>
+
+  options :
+  -h|--help: If this option is given, then the tool just prints the usage of this tool 
+           so that the user can refresh his mind on the way this tool works and exits.
+  -d|--debug: Optional: If this option is given, then the tool should run in debug mode. The debug mode just activates 
+              additional output on STDOUT in order to understand the processing of the tool and detect an eventual location of a problem.
+
+  parameters :
+  <source version>: source version package
+  <target version>: target version package
+  <key file path>: This parameter specifies a path to a key file that will be used to sign the generated diff version file set.
+  <password>: Some keys may be encrypted by a password to protect them.
+  <output archive>: path to a (non existing) file that will contain the result of the tool processing, 
+"
+
+exit 0
+}
+
+
+LogE() {
+echo "$(date "+%Y/%m/%d %T") [ERROR] $1"
+rm -rf $TMP_DIR
+exit 1
+
+}
+
+LogW() {
+echo "$(date "+%Y/%m/%d %T") [WARNING] $1"
+}
+
+
+LogI() {
+echo "$(date "+%Y/%m/%d %T") [INFO] $1"
+}
+
+LogD() {
+if [[ $debug == "-v" ]];then
+  echo "$(date "+%Y/%m/%d %T") [DEBUG] $1"
+fi
+}
+
+
+debug=""
+
+###  start here , get parameters
+for parameter in $* ;do
+#value=$(echo $option | sed '/^-[a-z]=(.*)$/\1/'  )
+#value=$(echo $option | sed '/^$/\1/'  )
+index=0
+# echo "p=${parameter:1}"
+  start=$(expr match "${parameter}" 'src\|tgt\|-verify\|key\|-pwd\|-h\|--help\|-d\|--debug\|-i\|cu\|imei\|-t') ### get matched head ,return matched num
+  if [[ $start -gt 0 ]];then
+    option=${parameter:0:$start} ### get option
+    value=${parameter:$start+1}  ### get option parameters
+#     echo " o=$option v=$value "
+    if [[ "$option" == "src" ]];then 
+      source=$value
+    elif [[ "$option" == "tgt" ]];then 
+      target=$value
+    elif [[ "$option" == "-verify" ]];then 
+      verify="true"
+    elif [[ "$option" == "key" ]];then 
+      key=$value
+    elif [[ "$option" == "-pwd" ]];then 
+      pwd_option="-r $value"
+    elif [[ "$option" == "cu" ]];then
+      cu="-c $value"
+    elif [[ "$option" == "-d" || "$option" == "--debug" ]];then 
+      debug="-v"
+    else
+      usage
+    fi
+  elif [[ ${parameter:0:1} != '-' ]];then
+    output_zip=$parameter
+  else
+    echo -ne "[ERROR] !!unvalid parameter '$parameter' !!\n"
+    usage
+    exit 1
+  fi
+done
+
+#check the parameters
+if [[ -z $output_zip ]];then
+  echo -ne "[ERROR]\n\noutput zip name not given!!\n"
+  usage
+  exit 1
+elif [[ ! -d $(dirname $output_zip) ]];then
+  echo "[ERROR] output directory $(dirname $output_zip) doesn't exist"
+  exit 1
+fi
+
+if [[ -z $key || ! -a $key.x509.pem ]];then
+  echo "key : $key "
+  echo "[ERROR] key $key not found"
+  exit 1
+fi
+
+toolsdir="$(dirname $0)/.." ### fota diff tools dir
+
+#build update package
+
+source tools_version.sh
+
+LogI "tools version : $VERSION"
+
+echo -ne "\ngenerating $output_zip...  \n"
+
+if [[ -f $output_zip ]];then
+  rm $output_zip
+  LogI "Remove exist $output_zip"
+fi
+if [[ -z "$source" ]];then ### full
+  ## full 
+  my_arch=`uname -m`
+  if [ $my_arch == "x86_64" ];then
+    # more memory for SD-upgrade.
+    #JA="--java_args=-Xmx4096m"
+    JA=""
+  else
+    JA=""
+  fi
+
+  cmdline="ota_from_target_files.py -w $debug --block -p $toolsdir -k $key $pwd_option \
+            $cu $JA $target $output_zip"
+
+  LogI "cmdline is : $cmdline"
+  $cmdline >$TMP_DIR/log 2>$TMP_DIR/stderr
+else ### diff
+  cmdline="ota_from_target_files.py $debug --block -i $source -p $toolsdir -k $key $pwd_option \
+              $target $output_zip"
+
+  LogI "cmdline is : $cmdline"
+  $cmdline >$TMP_DIR/log 2>$TMP_DIR/stderr
+fi
+
+res=$?
+
+while read line;do
+  LogI "ota_from_target_files : $line"
+done < $TMP_DIR/log
+
+while read line;do
+  LogI "ota_from_target_files (stderr): $line"
+done < $TMP_DIR/stderr
+
+
+rm -rf $TMP_DIR
+LogI "tools version : $VERSION DONE!"
+
+if [[ $res -ne 0 ]];then
+  LogE "ota_from_target_files failed with status: $res"
+  exit $res
+fi
+
